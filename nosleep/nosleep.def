@@ -1,0 +1,4 @@
+LIBRARY "nosleep"
+
+EXPORTS
+    DllEntryPoint @1
