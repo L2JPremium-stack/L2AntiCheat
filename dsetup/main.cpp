@@ -10,6 +10,8 @@
 #include <shellapi.h>
 #include <tlhelp32.h>
 #include <tchar.h>
+#include <objidl.h>
+#include <wincodec.h>
 #include <stdio.h>
 #include <cstring>
 #include <string>
@@ -36,6 +38,8 @@
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "windowscodecs.lib")
 
 static const unsigned short LOGIN_PORT = 2106;
 static const unsigned short GAME_PORT = 7777;
@@ -118,9 +122,6 @@ DWORD WINAPI OwnershipMonitorThread(LPVOID);
 DWORD WINAPI VoiceLifecycleThread(LPVOID);
 
 void ShowSplash();
-void DrawSplash();
-void FadeIn(HWND hwnd);
-void FadeOut(HWND hwnd);
 
 bool InitializeSharedState();
 void CloseSharedState();
@@ -490,113 +491,438 @@ void BuildPayload()
 
 }
 
-LRESULT CALLBACK SplashProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+struct SplashSurface
 {
-    return DefWindowProcW(hWnd, msg, wParam, lParam);
-}
+    HDC screenDc;
+    HDC memoryDc;
+    HBITMAP bitmap;
+    HGDIOBJ oldBitmap;
+    int width;
+    int height;
+};
 
-void DrawSplash()
+static void ReleaseSplashSurface(SplashSurface* surface);
+
+static bool CreateStreamFromResource(HINSTANCE instance, int resourceId, IStream** stream)
 {
-    HDC dc = GetDC(g_hSplash);
+    if (!stream)
+        return false;
 
-    HBITMAP bitmap = (HBITMAP)LoadImageW(
-        g_ModuleHandle,
-        MAKEINTRESOURCEW(IDB_SPLASHLOAD),
-        IMAGE_BITMAP,
-        0,
-        0,
-        LR_CREATEDIBSECTION
+    HRSRC resource = FindResourceW(
+        instance,
+        MAKEINTRESOURCEW(resourceId),
+        RT_RCDATA
     );
 
-    if (!bitmap)
+    if (!resource)
+        return false;
+
+    DWORD size = SizeofResource(instance, resource);
+    if (size == 0)
+        return false;
+
+    HGLOBAL loadedResource = LoadResource(instance, resource);
+    if (!loadedResource)
+        return false;
+
+    void* resourceData = LockResource(loadedResource);
+    if (!resourceData)
+        return false;
+
+    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, size);
+    if (!memory)
+        return false;
+
+    void* memoryData = GlobalLock(memory);
+    if (!memoryData)
     {
-        ReleaseDC(g_hSplash, dc);
+        GlobalFree(memory);
+        return false;
+    }
+
+    CopyMemory(memoryData, resourceData, size);
+    GlobalUnlock(memory);
+
+    HRESULT hr = CreateStreamOnHGlobal(memory, TRUE, stream);
+    if (FAILED(hr) || !*stream)
+    {
+        GlobalFree(memory);
+        return false;
+    }
+
+    return true;
+}
+
+static bool CreateEmptySplashSurface(int width, int height, SplashSurface* surface, void** bits)
+{
+    if (width <= 0 || height <= 0 || !surface || !bits)
+        return false;
+
+    surface->screenDc = GetDC(NULL);
+    if (!surface->screenDc)
+        return false;
+
+    surface->memoryDc = CreateCompatibleDC(surface->screenDc);
+    if (!surface->memoryDc)
+    {
+        ReleaseDC(NULL, surface->screenDc);
+        surface->screenDc = NULL;
+        return false;
+    }
+
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = width;
+    bmi.bmiHeader.biHeight = -height;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    surface->bitmap = CreateDIBSection(
+        surface->screenDc,
+        &bmi,
+        DIB_RGB_COLORS,
+        bits,
+        NULL,
+        0
+    );
+
+    if (!surface->bitmap)
+    {
+        DeleteDC(surface->memoryDc);
+        ReleaseDC(NULL, surface->screenDc);
+        surface->memoryDc = NULL;
+        surface->screenDc = NULL;
+        return false;
+    }
+
+    surface->oldBitmap = SelectObject(surface->memoryDc, surface->bitmap);
+    if (!surface->oldBitmap)
+    {
+        DeleteObject(surface->bitmap);
+        DeleteDC(surface->memoryDc);
+        ReleaseDC(NULL, surface->screenDc);
+        surface->bitmap = NULL;
+        surface->screenDc = NULL;
+        surface->memoryDc = NULL;
+        return false;
+    }
+
+    surface->width = width;
+    surface->height = height;
+    return true;
+}
+
+static bool CreateSplashSurfaceFromPng(HINSTANCE instance, int resourceId, SplashSurface* surface)
+{
+    if (!surface)
+        return false;
+
+    IStream* stream = NULL;
+    IWICImagingFactory* factory = NULL;
+    IWICBitmapDecoder* decoder = NULL;
+    IWICBitmapFrameDecode* frame = NULL;
+    IWICFormatConverter* converter = NULL;
+    UINT width = 0;
+    UINT height = 0;
+    void* bits = NULL;
+    UINT stride = 0;
+    UINT imageSize = 0;
+
+    bool ok = false;
+
+    if (!CreateStreamFromResource(instance, resourceId, &stream))
+        goto cleanup;
+
+    if (FAILED(CoCreateInstance(
+        CLSID_WICImagingFactory,
+        NULL,
+        CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(&factory)
+    )))
+    {
+        goto cleanup;
+    }
+
+    if (FAILED(factory->CreateDecoderFromStream(
+        stream,
+        NULL,
+        WICDecodeMetadataCacheOnLoad,
+        &decoder
+    )))
+    {
+        goto cleanup;
+    }
+
+    if (FAILED(decoder->GetFrame(0, &frame)))
+        goto cleanup;
+
+    if (FAILED(frame->GetSize(&width, &height)) || width == 0 || height == 0)
+        goto cleanup;
+
+    if (width > 8192 || height > 8192)
+        goto cleanup;
+
+    if (FAILED(factory->CreateFormatConverter(&converter)))
+        goto cleanup;
+
+    if (FAILED(converter->Initialize(
+        frame,
+        GUID_WICPixelFormat32bppPBGRA,
+        WICBitmapDitherTypeNone,
+        NULL,
+        0.0,
+        WICBitmapPaletteTypeCustom
+    )))
+    {
+        goto cleanup;
+    }
+
+    if (!CreateEmptySplashSurface(
+        static_cast<int>(width),
+        static_cast<int>(height),
+        surface,
+        &bits
+    ))
+    {
+        goto cleanup;
+    }
+
+    stride = width * 4;
+    imageSize = stride * height;
+
+    if (FAILED(converter->CopyPixels(
+        NULL,
+        stride,
+        imageSize,
+        static_cast<BYTE*>(bits)
+    )))
+    {
+        ReleaseSplashSurface(surface);
+        goto cleanup;
+    }
+
+    ok = true;
+
+cleanup:
+    if (converter)
+        converter->Release();
+    if (frame)
+        frame->Release();
+    if (decoder)
+        decoder->Release();
+    if (factory)
+        factory->Release();
+    if (stream)
+        stream->Release();
+
+    return ok;
+}
+
+static void ReleaseSplashSurface(SplashSurface* surface)
+{
+    if (!surface)
         return;
-    }
 
-    HDC memoryDc = CreateCompatibleDC(dc);
-    HGDIOBJ oldObject = SelectObject(memoryDc, bitmap);
+    if (surface->memoryDc && surface->oldBitmap)
+        SelectObject(surface->memoryDc, surface->oldBitmap);
 
-    PROCESSENTRY32W entry{};
-    entry.dwSize = sizeof(entry);
+    if (surface->bitmap)
+        DeleteObject(surface->bitmap);
 
-    BITMAP bmp{};
-    GetObject(bitmap, sizeof(bmp), &bmp);
+    if (surface->memoryDc)
+        DeleteDC(surface->memoryDc);
 
-    BitBlt(dc, 0, 0, bmp.bmWidth, bmp.bmHeight, memoryDc, 0, 0, SRCCOPY);
+    if (surface->screenDc)
+        ReleaseDC(NULL, surface->screenDc);
 
-    SelectObject(memoryDc, oldObject);
-    DeleteDC(memoryDc);
-    DeleteObject(bitmap);
-    ReleaseDC(g_hSplash, dc);
+    surface->screenDc = NULL;
+    surface->memoryDc = NULL;
+    surface->bitmap = NULL;
+    surface->oldBitmap = NULL;
+    surface->width = 0;
+    surface->height = 0;
 }
 
-void FadeIn(HWND hwnd)
+static bool UpdateSplashLayer(HWND hwnd, SplashSurface* surface, POINT position, BYTE alpha)
 {
-    for (int i = 0; i <= 255; i += 5)
+    if (!hwnd || !surface || !surface->screenDc || !surface->memoryDc)
+        return false;
+
+    POINT source = {};
+    SIZE size = {};
+    BLENDFUNCTION blend = {};
+
+    size.cx = surface->width;
+    size.cy = surface->height;
+    blend.BlendOp = AC_SRC_OVER;
+    blend.SourceConstantAlpha = alpha;
+    blend.AlphaFormat = AC_SRC_ALPHA;
+
+    return UpdateLayeredWindow(
+        hwnd,
+        surface->screenDc,
+        &position,
+        &size,
+        surface->memoryDc,
+        &source,
+        0,
+        &blend,
+        ULW_ALPHA
+    ) == TRUE;
+}
+
+static BYTE SmoothAlpha(BYTE fromAlpha, BYTE toAlpha, int step, int steps)
+{
+    double progress = step / static_cast<double>(steps);
+    double eased = progress * progress * (3.0 - (2.0 * progress));
+    double alpha = fromAlpha + ((toAlpha - fromAlpha) * eased);
+
+    if (alpha < 0.0)
+        alpha = 0.0;
+    else if (alpha > 255.0)
+        alpha = 255.0;
+
+    return static_cast<BYTE>(alpha);
+}
+
+static void FadeSplash(HWND hwnd, SplashSurface* surface, POINT position, BYTE fromAlpha, BYTE toAlpha, DWORD durationMs)
+{
+    const int steps = 24;
+    DWORD frameDelay = durationMs / steps;
+
+    if (frameDelay == 0)
+        frameDelay = 1;
+
+    for (int step = 0; step <= steps; ++step)
     {
-        SetLayeredWindowAttributes(hwnd, 0, (BYTE)i, LWA_ALPHA);
-        Sleep(5);
+        UpdateSplashLayer(
+            hwnd,
+            surface,
+            position,
+            SmoothAlpha(fromAlpha, toAlpha, step, steps)
+        );
+        Sleep(frameDelay);
     }
 }
 
-void FadeOut(HWND hwnd)
+static POINT GetCenteredSplashPosition(int width, int height)
 {
-    for (int i = 255; i >= 0; i -= 5)
+    RECT workArea = {};
+
+    if (!SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0))
     {
-        SetLayeredWindowAttributes(hwnd, 0, (BYTE)i, LWA_ALPHA);
-        Sleep(5);
+        workArea.left = 0;
+        workArea.top = 0;
+        workArea.right = GetSystemMetrics(SM_CXSCREEN);
+        workArea.bottom = GetSystemMetrics(SM_CYSCREEN);
     }
+
+    POINT position = {};
+    position.x = workArea.left + ((workArea.right - workArea.left - width) / 2);
+    position.y = workArea.top + ((workArea.bottom - workArea.top - height) / 2);
+
+    return position;
+}
+
+LRESULT CALLBACK SplashProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg)
+    {
+        case WM_ERASEBKGND:
+            return 1;
+    }
+
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
 void ShowSplash()
 {
+    HRESULT coInit = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    bool uninitializeCom = SUCCEEDED(coInit);
+
+    if (FAILED(coInit) && coInit != RPC_E_CHANGED_MODE)
+        return;
+
+    SplashSurface surface = {};
+
+    if (!CreateSplashSurfaceFromPng(g_ModuleHandle, IDB_SPLASHLOAD, &surface))
+    {
+        if (uninitializeCom)
+            CoUninitialize();
+        return;
+    }
+
+    int width = surface.width;
+    int height = surface.height;
+    POINT position = GetCenteredSplashPosition(width, height);
+
     static bool classRegistered = false;
 
     if (!classRegistered)
     {
-        WNDCLASSW wc = { 0 };
+        WNDCLASSW wc = {};
         wc.lpfnWndProc = SplashProc;
         wc.hInstance = g_ModuleHandle;
         wc.lpszClassName = L"L2SplashClass";
+        wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
 
         if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        {
+            ReleaseSplashSurface(&surface);
+            if (uninitializeCom)
+                CoUninitialize();
             return;
+        }
 
         classRegistered = true;
     }
 
-    int width = 256;
-    int height = 128;
-
-    int screenW = GetSystemMetrics(SM_CXSCREEN);
-    int screenH = GetSystemMetrics(SM_CYSCREEN);
-
-    int x = screenW - width - 20;
-    int y = screenH - height - 60;
-
     g_hSplash = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
         L"L2SplashClass",
         L"",
         WS_POPUP,
-        x, y, width, height,
-        NULL, NULL,
+        position.x,
+        position.y,
+        width,
+        height,
+        NULL,
+        NULL,
         g_ModuleHandle,
         NULL
     );
 
     if (!g_hSplash)
+    {
+        ReleaseSplashSurface(&surface);
+        if (uninitializeCom)
+            CoUninitialize();
         return;
+    }
 
-    ShowWindow(g_hSplash, SW_SHOW);
-    SetLayeredWindowAttributes(g_hSplash, 0, 0, LWA_ALPHA);
-    DrawSplash();
-    FadeIn(g_hSplash);
-    Sleep(2000);
-    FadeOut(g_hSplash);
+    if (!UpdateSplashLayer(g_hSplash, &surface, position, 255))
+    {
+        ReleaseSplashSurface(&surface);
+        DestroyWindow(g_hSplash);
+        g_hSplash = NULL;
+        if (uninitializeCom)
+            CoUninitialize();
+        return;
+    }
+
+    ShowWindow(g_hSplash, SW_SHOWNOACTIVATE);
+    UpdateWindow(g_hSplash);
+
+    Sleep(1800);
+    FadeSplash(g_hSplash, &surface, position, 255, 0, 180);
+
+    ReleaseSplashSurface(&surface);
     DestroyWindow(g_hSplash);
     g_hSplash = NULL;
+
+    if (uninitializeCom)
+        CoUninitialize();
 }
 
 DWORD WINAPI SplashThread(LPVOID)

@@ -92,7 +92,7 @@
     <None Include="tray_icon.ico">
       <Filter>Resource Files</Filter>
     </None>
-    <None Include="protect_splash.bmp">
+    <None Include="protect_splash.png">
       <Filter>Resource Files</Filter>
     </None>
   </ItemGroup>

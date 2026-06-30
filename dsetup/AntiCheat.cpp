@@ -109,15 +109,14 @@ static const wchar_t* g_AllowedGameModules[] =
     L"discordhook.dll", L"nvspcap.dll", L"gameoverlayrenderer.dll",
     L"gameoverlayrenderer64.dll", L"rtsshooks.dll",
 
-     L"L2CraftClub.dll", L"EmuDev.dll",
-      L"discord_game_sdk.dll"
+     L"L2CraftClub.dll", L"EmuDev.dll", L"discord_game_sdk.dll", 
 
 };
 
 static const wchar_t* g_HijackSensitiveSystemDlls[] =
 {
     L"iphlpapi.dll", L"comdlg32.dll", L"winmm.dll", L"version.dll", L"ws2_32.dll",
-    L"crypt32.dll", L"dnsapi.dll", L"user32.dll", L"kernel32.dll", L"advapi32.dll"
+    L"crypt32.dll", L"dnsapi.dll", L"user32.dll", L"kernel32.dll", L"advapi32.dll", L"gdiplus.dll"
 };
 
 static const wchar_t* g_BlockedDriverKeywords[] =

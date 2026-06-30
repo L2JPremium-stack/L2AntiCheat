@@ -119,7 +119,7 @@
   <ItemGroup>
     <None Include="dsetup.def" />
     <None Include="tray_icon.ico" />
-    <None Include="protect_splash.bmp" />
+    <None Include="protect_splash.png" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="AccountLogin.h" />
